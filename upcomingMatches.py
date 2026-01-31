@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 
 # --- Configuration ---
 # NOTE: Season is the year the season STARTS (e.g., 2024 for 2024/25 season)
+
 SEASON = 2025
 
 # football-data.org API
