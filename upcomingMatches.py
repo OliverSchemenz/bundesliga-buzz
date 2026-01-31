@@ -5,16 +5,29 @@ from dataclasses import dataclass, field
 
 # --- Configuration ---
 # NOTE: Season is the year the season STARTS (e.g., 2024 for 2024/25 season)
-SEASON = 2025
-COMPETITION = "BL1"  # Bundesliga
+SEASON = 2024
 
 # football-data.org API
 API_BASE = "https://api.football-data.org/v4"
 API_KEY = "f1cc4ca1173d4528b60411d86ad12b2c"
 
-# Label thresholds
+# Available leagues (football-data.org free tier)
+LEAGUES = {
+    "🇩🇪 Bundesliga": {"code": "BL1", "teams": 18},
+    "🇩🇪 2. Bundesliga": {"code": "BL2", "teams": 18},
+    "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premier League": {"code": "PL", "teams": 20},
+    "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Championship": {"code": "ELC", "teams": 24},
+    "🇪🇸 La Liga": {"code": "PD", "teams": 20},
+    "🇪🇸 Segunda División": {"code": "SD", "teams": 22},
+    "🇮🇹 Serie A": {"code": "SA", "teams": 20},
+    "🇮🇹 Serie B": {"code": "SB", "teams": 20},
+    "🇫🇷 Ligue 1": {"code": "FL1", "teams": 18},
+    "🇫🇷 Ligue 2": {"code": "FL2", "teams": 18},
+}
+
+# Label thresholds (some will be calculated dynamically based on league size)
 TITLE_RACE_MAX_POS = 8
-RELEGATION_MIN_POS = 13
+RELEGATION_MIN_POS = 13  # Base for 18-team leagues, adjusted dynamically for larger leagues
 CLOSE_MATCH_DISTANCE = 5  # Position distance for title race / relegation
 CLOSE_MATCH_POINTS = 7  # Points distance for head-to-head label
 UPSET_DISTANCE = 10  # Position distance for upset potential
@@ -39,13 +52,14 @@ class Team:
     short_name: str
     position: int
     points: int
+    num_teams: int  # Total teams in league for dynamic calculations
     crest_url: str = ""
     form: list[FormMatch] = field(default_factory=list)
 
     @property
     def buzz_score(self) -> int:
-        """Higher table position = higher buzz score (1st place = 18 pts)"""
-        return 19 - self.position
+        """Higher table position = higher buzz score"""
+        return self.num_teams - self.position
 
     @property
     def form_display(self) -> str:
@@ -80,6 +94,11 @@ class Match:
     away_score: int = 0
 
     @property
+    def num_teams(self) -> int:
+        """Get number of teams in the league from home team."""
+        return self.home.num_teams
+
+    @property
     def base_score(self) -> int:
         return self.home.buzz_score + self.away.buzz_score
 
@@ -94,11 +113,25 @@ class Match:
     @property
     def closeness_bonus(self) -> float:
         """Teams closer in table = higher bonus (1.0 to ~2.0)"""
-        return 1 + (17 - self.position_distance) / 17
+        max_distance = self.num_teams - 1
+        return 1 + (max_distance - self.position_distance) / max_distance
+
+    @property
+    def max_buzz(self) -> float:
+        """Maximum possible buzz score (1st vs 1st)."""
+        # base = (num_teams - 1) + (num_teams - 1) = 2 * (num_teams - 1)
+        # closeness = 2 (distance = 0)
+        return 4 * (self.num_teams - 1)
+
+    @property
+    def buzz_raw(self) -> float:
+        """Raw buzz score before normalization."""
+        return self.base_score * self.closeness_bonus
 
     @property
     def buzz(self) -> float:
-        return self.base_score * self.closeness_bonus
+        """Normalized buzz score (0-100 scale)."""
+        return (self.buzz_raw / self.max_buzz) * 100
 
     @property
     def titan_slayed(self) -> bool:
@@ -116,6 +149,14 @@ class Match:
         return underdog_score > favorite_score and self.position_distance >= UPSET_DISTANCE
 
     @property
+    def relegation_min_pos(self) -> int:
+        """Dynamic relegation zone start based on league size.
+        Base is RELEGATION_MIN_POS (13) for 18-team leagues,
+        adjusted by (num_teams - 18) for larger leagues.
+        """
+        return RELEGATION_MIN_POS + (self.num_teams - 18)
+
+    @property
     def labels(self) -> list[str]:
         labels = []
         highest_pos = min(self.home.position, self.away.position)
@@ -131,7 +172,7 @@ class Match:
             labels.append("🏆 Title Race")
 
         # Relegation Battle: both teams near the bottom and close in standings
-        if highest_pos >= RELEGATION_MIN_POS and self.position_distance <= CLOSE_MATCH_DISTANCE:
+        if highest_pos >= self.relegation_min_pos and self.position_distance <= CLOSE_MATCH_DISTANCE:
             labels.append("🔥 Relegation Battle")
 
         # SECONDARY LABELS
@@ -155,12 +196,9 @@ def api_request(endpoint: str, params: dict = None) -> dict:
         response = requests.get(url, headers=headers, params=params, timeout=30)
 
         if response.status_code == 429:
-            # Rate limited - wait and retry
+            # Rate limited - wait and retry (silently, UI handled elsewhere)
             retry_after = int(response.headers.get("X-RequestCounter-Reset", 60))
-            placeholder = st.empty()
-            placeholder.warning(f"Rate limit erreicht, warte {retry_after}s...")
             time.sleep(retry_after)
-            placeholder.empty()
             response = requests.get(url, headers=headers, params=params, timeout=30)
 
         if response.status_code != 200:
@@ -175,16 +213,16 @@ def api_request(endpoint: str, params: dict = None) -> dict:
         raise Exception(f"Request Fehler: {e}")
 
 
-@st.cache_data(ttl=300)  # Cache for ~5 minutes
-def fetch_standings_cached() -> list[dict]:
-    """Fetch current Bundesliga standings (cached)."""
-    data = api_request(f"/competitions/{COMPETITION}/standings", {"season": SEASON})
+@st.cache_data(ttl=6000)  # Cache for ~100 minutes
+def fetch_standings_cached(competition: str) -> list[dict]:
+    """Fetch current standings (cached)."""
+    data = api_request(f"/competitions/{competition}/standings", {"season": SEASON})
     return data["standings"][0]["table"]
 
 
-def fetch_standings() -> dict[int, Team]:
+def fetch_standings(competition: str, num_teams: int) -> dict[int, Team]:
     """Build Team dict from cached standings."""
-    standings = fetch_standings_cached()
+    standings = fetch_standings_cached(competition)
 
     teams = {}
     for entry in standings:
@@ -197,32 +235,33 @@ def fetch_standings() -> dict[int, Team]:
             short_name=team_data.get("shortName", team_data["name"]),
             position=entry["position"],
             points=entry["points"],
+            num_teams=num_teams,
             crest_url=team_data.get("crest", "")
         )
 
     return teams
 
 
-@st.cache_data(ttl=300)
-def fetch_current_matchday() -> int:
+@st.cache_data(ttl=6000)
+def fetch_current_matchday(competition: str) -> int:
     """Get the current matchday number (cached)."""
-    data = api_request(f"/competitions/{COMPETITION}", {"season": SEASON})
+    data = api_request(f"/competitions/{competition}", {"season": SEASON})
     return data["currentSeason"]["currentMatchday"]
 
 
-@st.cache_data(ttl=300)
-def fetch_matches_cached(matchday: int) -> list[dict]:
+@st.cache_data(ttl=6000)
+def fetch_matches_cached(competition: str, matchday: int) -> list[dict]:
     """Fetch matches for a specific matchday (cached)."""
     data = api_request(
-        f"/competitions/{COMPETITION}/matches",
+        f"/competitions/{competition}/matches",
         {"season": SEASON, "matchday": matchday}
     )
     return data.get("matches", [])
 
 
-def fetch_matches(matchday: int, teams: dict[int, Team]) -> list[Match]:
+def fetch_matches(competition: str, matchday: int, teams: dict[int, Team]) -> list[Match]:
     """Fetch matches for a specific matchday."""
-    matches_data = fetch_matches_cached(matchday)
+    matches_data = fetch_matches_cached(competition, matchday)
 
     matches = []
     for m in matches_data:
@@ -341,7 +380,7 @@ def format_kickoff(iso_datetime: str) -> str:
 
 
 # --- Streamlit UI ---
-st.set_page_config(page_title="Bundesliga Buzz", page_icon="⚽", layout="wide")
+st.set_page_config(page_title="Football Buzz", page_icon="⚽", layout="wide")
 
 # Mobile-responsive CSS
 st.markdown("""
@@ -372,14 +411,27 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("⚽ Bundesliga Buzz Dashboard")
+st.title("⚽ Football Buzz Dashboard")
 st.caption("Welche Spiele sind diese Woche am spannendsten?")
 
+# League selector at the top
+selected_league = st.selectbox(
+    "Liga auswählen",
+    options=list(LEAGUES.keys()),
+    index=0,  # Default to first league (Bundesliga)
+    key="league_selector"
+)
+
+# Get league config
+league_config = LEAGUES[selected_league]
+competition = league_config["code"]
+num_teams = league_config["teams"]
+
 # Fetch standings
-with st.spinner("Lade Tabelle..."):
+with st.spinner(f"Lade {selected_league} Tabelle..."):
     try:
-        teams = fetch_standings()
-        current_matchday = fetch_current_matchday()
+        teams = fetch_standings(competition, num_teams)
+        current_matchday = fetch_current_matchday(competition)
     except Exception as e:
         st.error(f"Fehler beim Laden der Daten: {e}")
         st.stop()
@@ -425,7 +477,7 @@ with col3:
 # Fetch matches for selected matchday
 with st.spinner(f"Lade Spieltag {selected_matchday}..."):
     try:
-        matches = fetch_matches(selected_matchday, teams)
+        matches = fetch_matches(competition, selected_matchday, teams)
     except Exception as e:
         st.error(f"Fehler beim Laden der Spiele: {e}")
         st.stop()
@@ -536,6 +588,9 @@ else:
 
         st.divider()
 
+    # Calculate dynamic relegation position for current league
+    relegation_min_pos = RELEGATION_MIN_POS + (num_teams - 18)
+
     # Legend (collapsible for mobile)
     with st.expander("📋 Label-Legende & Buzz-Statistik", expanded=False):
         legend_cols = st.columns(2)
@@ -543,22 +598,23 @@ else:
         with legend_cols[0]:
             st.markdown("**Primär**")
             st.markdown(f"🏆 **Title Race** — Beide ≤ Platz {TITLE_RACE_MAX_POS}, ≤ {CLOSE_MATCH_DISTANCE} Plätze")
-            st.markdown(f"🔥 **Relegation** — Beide ≥ Platz {RELEGATION_MIN_POS}, ≤ {CLOSE_MATCH_DISTANCE} Plätze")
+            st.markdown(f"🔥 **Relegation** — Beide ≥ Platz {relegation_min_pos}, ≤ {CLOSE_MATCH_DISTANCE} Plätze")
             st.markdown("**Sekundär**")
             st.markdown(f"🎯 **Head-to-Head** — ≤ {CLOSE_MATCH_POINTS} Punkte Differenz")
             st.markdown(f"⚡ **Upset Potential** — ≥ {UPSET_DISTANCE} Plätze Abstand")
             st.markdown(f"⚔️ **TITAN SLAYED** — Underdog gewinnt bei ≥ {UPSET_DISTANCE} Plätze Abstand")
 
         with legend_cols[1]:
-            st.markdown("**Buzz-Score Bereiche**")
-            st.markdown("""
+            st.markdown(f"**Buzz-Score ({selected_league})**")
+            st.markdown(f"""
             | Label | Erwarteter Buzz |
             |-------|-----------------|
-            | 🏆 Title Race | 44 - 72 |
-            | 🔥 Relegation | 4 - 24 |
-            | ⚡ Upset | 19 - 38 |
-            | Ø Durchschnitt | ~30 |
-            | Maximum | 72 (1. vs 1.) |
+            | 🏆 Title Race | 70 - 100 |
+            | 🔥 Relegation | 5 - 30 |
+            | ⚡ Upset | 25 - 50 |
+            | Maximum | 100 (1. vs 1.) |
+
+            *Normalisiert auf 0-100 Skala*
             """)
             st.markdown("**Status-Indikatoren**")
             st.markdown("🏆 = TITAN SLAYED")
@@ -571,7 +627,7 @@ else:
 
 # Sidebar: Current Table
 with st.sidebar:
-    st.header("📊 Aktuelle Tabelle")
+    st.header(f"📊 {selected_league}")
 
     for team in sorted(teams.values(), key=lambda t: t.position):
         col_crest, col_info = st.columns([1, 4])
@@ -584,14 +640,17 @@ with st.sidebar:
     st.divider()
     st.header("ℹ️ Scoring-Logik")
     st.markdown(f"""
-    **Buzz-Score** = Base × Closeness
+    **Buzz-Score** (0-100 normalisiert)
 
-    - **Base** = `(19 - Pos_A) + (19 - Pos_B)`
-    - **Closeness** = `1 + (17 - Abstand) / 17`
+    `Buzz = (Base × Closeness) / Max × 100`
+
+    - **Base** = `({num_teams} - Pos_A) + ({num_teams} - Pos_B)`
+    - **Closeness** = `1 + ({num_teams - 1} - Abstand) / {num_teams - 1}`
+    - **Max** = {4 * (num_teams - 1)} (1. vs 1.)
 
     **Primär:**
     - 🏆 **Title Race**: Beide ≤ Platz {TITLE_RACE_MAX_POS}, ≤ {CLOSE_MATCH_DISTANCE} Plätze
-    - 🔥 **Relegation**: Beide ≥ Platz {RELEGATION_MIN_POS}, ≤ {CLOSE_MATCH_DISTANCE} Plätze
+    - 🔥 **Relegation**: Beide ≥ Platz {RELEGATION_MIN_POS + (num_teams - 18)}, ≤ {CLOSE_MATCH_DISTANCE} Plätze
 
     **Sekundär:**
     - 🎯 **Head-to-Head**: ≤ {CLOSE_MATCH_POINTS} Pkt Differenz
