@@ -315,6 +315,37 @@ def format_kickoff(iso_datetime: str) -> str:
 # --- Streamlit UI ---
 st.set_page_config(page_title="Bundesliga Buzz", page_icon="⚽", layout="wide")
 
+# Mobile-responsive CSS
+st.markdown("""
+<style>
+    /* Compact metrics */
+    [data-testid="stMetricValue"] {
+        font-size: 1.2rem !important;
+    }
+    [data-testid="stMetricLabel"] {
+        display: none !important;
+    }
+
+    /* Mobile adjustments */
+    @media (max-width: 640px) {
+        [data-testid="stMetricValue"] {
+            font-size: 1rem !important;
+        }
+        img {
+            max-width: 28px !important;
+        }
+        .stMarkdown small {
+            font-size: 0.7rem !important;
+        }
+    }
+
+    /* Tooltip cursor */
+    span[title] {
+        cursor: help;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 st.title("⚽ Bundesliga Buzz Dashboard")
 st.caption("Welche Spiele sind diese Woche am spannendsten?")
 
@@ -331,6 +362,9 @@ with st.spinner("Lade Tabelle..."):
 with st.sidebar:
     load_form = st.checkbox("Form laden (Liga und CL)", value=False,
                             help="Dauert ~2 Min beim ersten Mal (Rate Limit). Danach gecached.")
+    if st.button("🔄 Cache leeren", help="Erzwingt Neuladen aller Daten"):
+        st.cache_data.clear()
+        st.rerun()
 
 # Compute form for all teams (optional)
 if load_form:
@@ -381,60 +415,61 @@ else:
 
     for i, match in enumerate(matches):
         with st.container():
-            # Layout: [Rank, HomeIcon, HomeName, vs, AwayIcon, AwayName, Buzz, Labels]
-            cols = st.columns([0.4, 0.5, 2.5, 0.8, 0.5, 2.5, 1, 2])
+            # Compact layout: 2 main columns (match info | buzz/labels)
+            main_cols = st.columns([4, 1.5])
 
-            # Rank
-            cols[0].markdown(f"**#{i + 1}**")
+            with main_cols[0]:
+                # Match info in sub-columns
+                team_cols = st.columns([0.6, 3, 0.5, 0.6, 3])
 
-            # Home icon
-            if match.home.crest_url:
-                cols[1].image(match.home.crest_url, width=40)
+                # Home icon
+                if match.home.crest_url:
+                    team_cols[0].image(match.home.crest_url, width=35)
 
-            # Home team
-            cols[2].markdown(f"**{match.home.short_name}**")
-            cols[2].markdown(f"<small>Platz {match.home.position} • {match.home.form_display_html()}</small>",
-                             unsafe_allow_html=True)
+                # Home team
+                team_cols[1].markdown(f"**{match.home.short_name}**")
+                team_cols[1].markdown(f"<small>#{match.home.position} • {match.home.form_display_html()}</small>",
+                                      unsafe_allow_html=True)
 
-            # vs
-            cols[3].markdown("**vs**")
+                # vs
+                team_cols[2].markdown("—")
 
-            # Away icon
-            if match.away.crest_url:
-                cols[4].image(match.away.crest_url, width=40)
+                # Away icon
+                if match.away.crest_url:
+                    team_cols[3].image(match.away.crest_url, width=35)
 
-            # Away team
-            cols[5].markdown(f"**{match.away.short_name}**")
-            cols[5].markdown(f"<small>Platz {match.away.position} • {match.away.form_display_html()}</small>",
-                             unsafe_allow_html=True)
+                # Away team
+                team_cols[4].markdown(f"**{match.away.short_name}**")
+                team_cols[4].markdown(f"<small>#{match.away.position} • {match.away.form_display_html()}</small>",
+                                      unsafe_allow_html=True)
 
-            # Buzz score or final result
-            if match.is_finished:
-                cols[6].metric("Ergebnis", f"{match.home_score}:{match.away_score}")
-            else:
-                cols[6].metric("Buzz", f"{match.buzz:.1f}")
+            with main_cols[1]:
+                # Buzz score or final result
+                if match.is_finished:
+                    st.metric("", f"{match.home_score}:{match.away_score}")
+                else:
+                    st.metric("", f"🔥 {match.buzz:.0f}")
+                    st.caption(f"📅 {format_kickoff(match.kickoff)}")
 
-            # Labels + Kickoff
-            labels_str = " ".join(match.labels) if match.labels else "—"
-            cols[7].markdown(f"**{labels_str}**")
-            cols[7].caption(format_kickoff(match.kickoff))
+                # Labels (show for both finished and upcoming)
+                if match.labels:
+                    st.caption(" ".join(match.labels))
 
             st.divider()
 
-    # Legend
-    st.subheader("📋 Label-Legende")
-    legend_cols = st.columns(2)
+    # Legend (collapsible for mobile)
+    with st.expander("📋 Label-Legende", expanded=False):
+        legend_cols = st.columns(2)
 
-    with legend_cols[0]:
-        st.markdown("**Primär**")
-        st.markdown(f"🏆 **Title Race** — Beide ≤ Platz {TITLE_RACE_MAX_POS}, ≤ {CLOSE_MATCH_DISTANCE} Plätze Abstand")
-        st.markdown(
-            f"🔥 **Relegation Battle** — Beide ≥ Platz {RELEGATION_MIN_POS}, ≤ {CLOSE_MATCH_DISTANCE} Plätze Abstand")
+        with legend_cols[0]:
+            st.markdown("**Primär**")
+            st.markdown(f"🏆 **Title Race** — Beide ≤ Platz {TITLE_RACE_MAX_POS}, ≤ {CLOSE_MATCH_DISTANCE} Plätze")
+            st.markdown(f"🔥 **Relegation** — Beide ≥ Platz {RELEGATION_MIN_POS}, ≤ {CLOSE_MATCH_DISTANCE} Plätze")
 
-    with legend_cols[1]:
-        st.markdown("**Sekundär**")
-        st.markdown(f"🎯 **Head-to-Head** — ≤ {CLOSE_MATCH_POINTS} Punkte Differenz")
-        st.markdown(f"⚡ **Upset Potential** — ≥ {UPSET_DISTANCE} Plätze Abstand")
+        with legend_cols[1]:
+            st.markdown("**Sekundär**")
+            st.markdown(f"🎯 **Head-to-Head** — ≤ {CLOSE_MATCH_POINTS} Punkte Differenz")
+            st.markdown(f"⚡ **Upset Potential** — ≥ {UPSET_DISTANCE} Plätze Abstand")
 
 # Sidebar: Current Table
 with st.sidebar:
