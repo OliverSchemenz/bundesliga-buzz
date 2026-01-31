@@ -101,10 +101,29 @@ class Match:
         return self.base_score * self.closeness_bonus
 
     @property
+    def titan_slayed(self) -> bool:
+        """Check if the underdog won (upset actually happened)."""
+        if not self.is_finished:
+            return False
+
+        # Determine favorite (lower position = better)
+        if self.home.position < self.away.position:
+            favorite_score, underdog_score = self.home_score, self.away_score
+        else:
+            favorite_score, underdog_score = self.away_score, self.home_score
+
+        # Underdog won and it was a potential upset match
+        return underdog_score > favorite_score and self.position_distance >= UPSET_DISTANCE
+
+    @property
     def labels(self) -> list[str]:
         labels = []
         highest_pos = min(self.home.position, self.away.position)
         lowest_pos = max(self.home.position, self.away.position)
+
+        # TITAN SLAYED: upset actually happened
+        if self.titan_slayed:
+            labels.append("⚔️ TITAN SLAYED")
 
         # PRIMARY LABELS (based on table position)
         # Title Race: both teams near the top and close in standings
@@ -138,8 +157,10 @@ def api_request(endpoint: str, params: dict = None) -> dict:
         if response.status_code == 429:
             # Rate limited - wait and retry
             retry_after = int(response.headers.get("X-RequestCounter-Reset", 60))
-            st.warning(f"Rate limit erreicht, warte {retry_after}s...")
+            placeholder = st.empty()
+            placeholder.warning(f"Rate limit erreicht, warte {retry_after}s...")
             time.sleep(retry_after)
+            placeholder.empty()
             response = requests.get(url, headers=headers, params=params, timeout=30)
 
         if response.status_code != 200:
@@ -154,7 +175,7 @@ def api_request(endpoint: str, params: dict = None) -> dict:
         raise Exception(f"Request Fehler: {e}")
 
 
-@st.cache_data(ttl=300)  # Cache for 5 minutes
+@st.cache_data(ttl=300)  # Cache for ~5 minutes
 def fetch_standings_cached() -> list[dict]:
     """Fetch current Bundesliga standings (cached)."""
     data = api_request(f"/competitions/{COMPETITION}/standings", {"season": SEASON})
@@ -235,11 +256,14 @@ def fetch_matches(matchday: int, teams: dict[int, Team]) -> list[Match]:
     return sorted(matches, key=lambda x: x.buzz, reverse=True)
 
 
-@st.cache_data(ttl=600, show_spinner=False)  # Cache form for 10 minutes
-def fetch_team_form_cached(team_id: int) -> list[dict]:
-    """Fetch last 5 match results for a team (all competitions)."""
+@st.cache_data(ttl=6000, show_spinner=False)  # Cache form for ~100 minutes
+def fetch_team_form_cached(team_id: int) -> tuple[list[dict], str]:
+    """Fetch last 5 match results for a team (all competitions). Returns (form_data, timestamp)."""
     # Rate limit delay - only executes when not cached
     time.sleep(REQUEST_DELAY)
+
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%d.%m.%Y %H:%M")
 
     try:
         data = api_request(
@@ -277,22 +301,26 @@ def fetch_team_form_cached(team_id: int) -> list[dict]:
                 "goals_against": goals_against
             })
 
-        return form
+        return form, timestamp
 
     except Exception:
-        return []
+        return [], timestamp
 
 
-def compute_team_form(teams: dict[int, Team], progress_bar=None) -> None:
-    """Fetch last 5 match results for each team (all competitions)."""
+def compute_team_form(teams: dict[int, Team], progress_bar=None) -> str:
+    """Fetch last 5 match results for each team (all competitions). Returns last fetch timestamp."""
     team_list = list(teams.items())
+    last_timestamp = ""
 
     for i, (team_id, team) in enumerate(team_list):
-        form_data = fetch_team_form_cached(team_id)
+        form_data, timestamp = fetch_team_form_cached(team_id)
         team.form = [FormMatch(**fm) for fm in form_data]
+        last_timestamp = timestamp
 
         if progress_bar:
             progress_bar.progress((i + 1) / len(team_list), f"Lade Form: {team.short_name}")
+
+    return last_timestamp
 
 
 def format_kickoff(iso_datetime: str) -> str:
@@ -318,21 +346,13 @@ st.set_page_config(page_title="Bundesliga Buzz", page_icon="⚽", layout="wide")
 # Mobile-responsive CSS
 st.markdown("""
 <style>
-    /* Compact metrics */
-    [data-testid="stMetricValue"] {
-        font-size: 1.2rem !important;
-    }
-    [data-testid="stMetricLabel"] {
-        display: none !important;
-    }
-
     /* Mobile adjustments */
     @media (max-width: 640px) {
-        [data-testid="stMetricValue"] {
-            font-size: 1rem !important;
-        }
         img {
             max-width: 28px !important;
+        }
+        h2 {
+            font-size: 1.2rem !important;
         }
         .stMarkdown small {
             font-size: 0.7rem !important;
@@ -342,6 +362,12 @@ st.markdown("""
     /* Tooltip cursor */
     span[title] {
         cursor: help;
+    }
+
+    /* Score display styling */
+    .score-display {
+        text-align: center;
+        font-weight: bold;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -367,16 +393,17 @@ with st.sidebar:
         st.rerun()
 
 # Compute form for all teams (optional)
+form_timestamp = None
 if load_form:
     form_status = st.empty()
     form_status.info("⏳ Form-Daten werden geladen (~2 Min beim ersten Mal, danach gecached)")
     progress = st.progress(0, "Lade Form...")
-    compute_team_form(teams, progress)
+    form_timestamp = compute_team_form(teams, progress)
     progress.empty()
     form_status.empty()
 
 # Filters
-col1, col2 = st.columns([1, 2])
+col1, col2, col3 = st.columns([1, 2, 1])
 with col1:
     selected_matchday = st.number_input(
         "Spieltag",
@@ -388,10 +415,12 @@ with col1:
 with col2:
     label_filter = st.multiselect(
         "Filter nach Typ",
-        options=["🏆 Title Race", "🔥 Relegation Battle", "🎯 Head-to-Head", "⚡ Upset Potential"],
+        options=["🏆 Title Race", "🔥 Relegation Battle", "🎯 Head-to-Head", "⚡ Upset Potential", "⚔️ TITAN SLAYED"],
         default=[],
         placeholder="Alle Spiele anzeigen"
     )
+with col3:
+    only_upcoming = st.checkbox("Nur kommende Spiele", value=False)
 
 # Fetch matches for selected matchday
 with st.spinner(f"Lade Spieltag {selected_matchday}..."):
@@ -401,9 +430,12 @@ with st.spinner(f"Lade Spieltag {selected_matchday}..."):
         st.error(f"Fehler beim Laden der Spiele: {e}")
         st.stop()
 
-# Apply label filter
+# Apply filters
 if label_filter:
     matches = [m for m in matches if any(lbl in m.labels for lbl in label_filter)]
+
+if only_upcoming:
+    matches = [m for m in matches if not m.is_finished]
 
 st.divider()
 
@@ -414,62 +446,128 @@ else:
     st.subheader(f"Spieltag {selected_matchday} — sortiert nach Buzz-Score")
 
     for i, match in enumerate(matches):
-        with st.container():
-            # Compact layout: 2 main columns (match info | buzz/labels)
-            main_cols = st.columns([4, 1.5])
+        # Status indicator prefix
+        if match.titan_slayed:
+            status_indicator = "🏆"  # Trophy for titan slayed
+        elif match.is_finished:
+            status_indicator = "✅"  # Checkmark for finished
+        else:
+            status_indicator = "⏳"  # Hourglass for upcoming
 
-            with main_cols[0]:
-                # Match info in sub-columns
-                team_cols = st.columns([0.6, 3, 0.5, 0.6, 3])
+        with st.container():
+            if match.is_finished:
+                # Finished match: score in the middle, buzz on the right
+                team_cols = st.columns([0.3, 0.8, 2.2, 1.2, 0.8, 2.2, 1.5, 2])
+
+                # Status indicator
+                team_cols[0].markdown(f"<span style='font-size:1.2rem;'>{status_indicator}</span>",
+                                      unsafe_allow_html=True)
 
                 # Home icon
                 if match.home.crest_url:
-                    team_cols[0].image(match.home.crest_url, width=35)
+                    team_cols[1].image(match.home.crest_url, width=50)
 
                 # Home team
-                team_cols[1].markdown(f"**{match.home.short_name}**")
-                team_cols[1].markdown(f"<small>#{match.home.position} • {match.home.form_display_html()}</small>",
+                team_cols[2].markdown(f"**{match.home.short_name}**")
+                team_cols[2].markdown(f"<small>#{match.home.position} • {match.home.form_display_html()}</small>",
                                       unsafe_allow_html=True)
 
-                # vs
-                team_cols[2].markdown("—")
+                # Score in the middle
+                team_cols[3].markdown(
+                    f"<h2 style='text-align:center; margin:0;'>{match.home_score} : {match.away_score}</h2>",
+                    unsafe_allow_html=True)
 
                 # Away icon
                 if match.away.crest_url:
-                    team_cols[3].image(match.away.crest_url, width=35)
+                    team_cols[4].image(match.away.crest_url, width=50)
 
                 # Away team
-                team_cols[4].markdown(f"**{match.away.short_name}**")
-                team_cols[4].markdown(f"<small>#{match.away.position} • {match.away.form_display_html()}</small>",
+                team_cols[5].markdown(f"**{match.away.short_name}**")
+                team_cols[5].markdown(f"<small>#{match.away.position} • {match.away.form_display_html()}</small>",
                                       unsafe_allow_html=True)
 
-            with main_cols[1]:
-                # Buzz score or final result
-                if match.is_finished:
-                    st.metric("", f"{match.home_score}:{match.away_score}")
-                else:
-                    st.metric("", f"🔥 {match.buzz:.0f}")
-                    st.caption(f"📅 {format_kickoff(match.kickoff)}")
+                # Buzz score
+                team_cols[6].markdown(
+                    f"<p style='font-size:0.7rem; margin:0; color:gray;'>Buzz:</p><p style='font-size:1.4rem; font-weight:bold; margin:0;'>🔥 {match.buzz:.0f}</p>",
+                    unsafe_allow_html=True)
 
-                # Labels (show for both finished and upcoming)
+                # Labels
                 if match.labels:
-                    st.caption(" ".join(match.labels))
+                    team_cols[7].markdown(" ".join(match.labels))
 
-            st.divider()
+            else:
+                # Upcoming match: buzz score on the right
+                team_cols = st.columns([0.3, 0.8, 2.4, 0.5, 0.8, 2.4, 1.5, 2])
+
+                # Status indicator
+                team_cols[0].markdown(f"<span style='font-size:1.2rem;'>{status_indicator}</span>",
+                                      unsafe_allow_html=True)
+
+                # Home icon
+                if match.home.crest_url:
+                    team_cols[1].image(match.home.crest_url, width=50)
+
+                # Home team
+                team_cols[2].markdown(f"**{match.home.short_name}**")
+                team_cols[2].markdown(f"<small>#{match.home.position} • {match.home.form_display_html()}</small>",
+                                      unsafe_allow_html=True)
+
+                # vs
+                team_cols[3].markdown("—")
+
+                # Away icon
+                if match.away.crest_url:
+                    team_cols[4].image(match.away.crest_url, width=50)
+
+                # Away team
+                team_cols[5].markdown(f"**{match.away.short_name}**")
+                team_cols[5].markdown(f"<small>#{match.away.position} • {match.away.form_display_html()}</small>",
+                                      unsafe_allow_html=True)
+
+                # Buzz score
+                team_cols[6].markdown(
+                    f"<p style='font-size:0.7rem; margin:0; color:gray;'>Buzz:</p><p style='font-size:1.4rem; font-weight:bold; margin:0;'>🔥 {match.buzz:.0f}</p>",
+                    unsafe_allow_html=True)
+
+                # Labels + Kickoff
+                team_cols[7].caption(f"📅 {format_kickoff(match.kickoff)}")
+                if match.labels:
+                    team_cols[7].markdown(" ".join(match.labels))
+
+        st.divider()
 
     # Legend (collapsible for mobile)
-    with st.expander("📋 Label-Legende", expanded=False):
+    with st.expander("📋 Label-Legende & Buzz-Statistik", expanded=False):
         legend_cols = st.columns(2)
 
         with legend_cols[0]:
             st.markdown("**Primär**")
             st.markdown(f"🏆 **Title Race** — Beide ≤ Platz {TITLE_RACE_MAX_POS}, ≤ {CLOSE_MATCH_DISTANCE} Plätze")
             st.markdown(f"🔥 **Relegation** — Beide ≥ Platz {RELEGATION_MIN_POS}, ≤ {CLOSE_MATCH_DISTANCE} Plätze")
-
-        with legend_cols[1]:
             st.markdown("**Sekundär**")
             st.markdown(f"🎯 **Head-to-Head** — ≤ {CLOSE_MATCH_POINTS} Punkte Differenz")
             st.markdown(f"⚡ **Upset Potential** — ≥ {UPSET_DISTANCE} Plätze Abstand")
+            st.markdown(f"⚔️ **TITAN SLAYED** — Underdog gewinnt bei ≥ {UPSET_DISTANCE} Plätze Abstand")
+
+        with legend_cols[1]:
+            st.markdown("**Buzz-Score Bereiche**")
+            st.markdown("""
+            | Label | Erwarteter Buzz |
+            |-------|-----------------|
+            | 🏆 Title Race | 44 - 72 |
+            | 🔥 Relegation | 4 - 24 |
+            | ⚡ Upset | 19 - 38 |
+            | Ø Durchschnitt | ~30 |
+            | Maximum | 72 (1. vs 1.) |
+            """)
+            st.markdown("**Status-Indikatoren**")
+            st.markdown("🏆 = TITAN SLAYED")
+            st.markdown("✅ = Spiel beendet")
+            st.markdown("⏳ = Kommend")
+
+    # Form timestamp hint
+    if form_timestamp:
+        st.caption(f"ℹ️ Team-Form zuletzt abgerufen: {form_timestamp} (Cache: ~100 Min)")
 
 # Sidebar: Current Table
 with st.sidebar:
@@ -498,6 +596,7 @@ with st.sidebar:
     **Sekundär:**
     - 🎯 **Head-to-Head**: ≤ {CLOSE_MATCH_POINTS} Pkt Differenz
     - ⚡ **Upset**: ≥ {UPSET_DISTANCE} Plätze Abstand
+    - ⚔️ **TITAN SLAYED**: Underdog gewinnt
 
     **Form:** 🟢 Sieg 🟡 Unentschieden 🔴 Niederlage
 
